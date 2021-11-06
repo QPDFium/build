@@ -306,7 +306,6 @@ def _OptimizeWithR8(options,
     # R8 OOMs with the default xmx=1G.
     cmd = build_utils.JavaCmd(options.warnings_as_errors, xmx='2G') + [
         '-Dcom.android.tools.r8.allowTestProguardOptions=1',
-        '-Dcom.android.tools.r8.verticalClassMerging=1',
         '-Dcom.android.tools.r8.disableHorizontalClassMerging=1',
     ]
     if options.disable_outlining:
@@ -376,12 +375,12 @@ def _OptimizeWithR8(options,
                               print_stdout=print_stdout,
                               stderr_filter=stderr_filter,
                               fail_on_output=options.warnings_as_errors)
-    except build_utils.CalledProcessError as err:
-      debugging_link = ('\n\nR8 failed. Please see {}.'.format(
+    except build_utils.CalledProcessError:
+      # Python will print the original exception as well.
+      raise Exception(
+          'R8 failed. Please see '
           'https://chromium.googlesource.com/chromium/src/+/HEAD/build/'
-          'android/docs/java_optimization.md#Debugging-common-failures\n'))
-      raise build_utils.CalledProcessError(err.cwd, err.args,
-                                           err.output + debugging_link)
+          'android/docs/java_optimization.md#Debugging-common-failures')
 
     base_has_imported_lib = False
     if options.desugar_jdk_libs_json:
@@ -467,46 +466,41 @@ def _CheckForMissingSymbols(r8_path, dex_files, classpath, warnings_as_errors,
 
         # TODO(agrieve): Create interface jars for these missing classes rather
         #     than allowlisting here.
-        'dalvik/system',
-        'libcore/io',
-        'sun/misc/Unsafe',
+        'dalvik.system',
+        'libcore.io',
+        'sun.misc.Unsafe',
 
         # Found in: com/facebook/fbui/textlayoutbuilder/StaticLayoutHelper
-        ('android/text/StaticLayout;<init>(Ljava/lang/CharSequence;IILandroid'
-         '/text/TextPaint;ILandroid/text/Layout$Alignment;Landroid/text/'
-         'TextDirectionHeuristic;FFZLandroid/text/TextUtils$TruncateAt;II)V'),
+        'android.text.StaticLayout.<init>',
 
-        # Found in
-        # com/google/android/gms/cast/framework/media/internal/ResourceProvider
-        # Missing due to setting "strip_resources = true".
-        'com/google/android/gms/cast/framework/R',
-
-        # Found in com/google/android/gms/common/GoogleApiAvailability
-        # Missing due to setting "strip_drawables = true".
-        'com/google/android/gms/base/R$drawable',
+        # Reflection is used to access some of these and they are allowed to be
+        # missing. See proguard.txt in androidx_window_window/window*.aar. See
+        # https://crbug.com/1039050 for usages of this library.
+        'androidx.window.extensions.',
+        'androidx.window.sidecar.',
 
         # Explicictly guarded by try (NoClassDefFoundError) in Flogger's
         # PlatformProvider.
-        'com/google/common/flogger/backend/google/GooglePlatform',
-        'com/google/common/flogger/backend/system/DefaultPlatform',
+        'com.google.common.flogger.backend.google.GooglePlatform',
+        'com.google.common.flogger.backend.system.DefaultPlatform',
 
         # trichrome_webview_google_bundle contains this missing reference.
         # TODO(crbug.com/1142530): Fix this missing reference properly.
-        'org/chromium/build/NativeLibraries',
+        'org.chromium.build.NativeLibraries',
 
         # TODO(agrieve): Exclude these only when use_jacoco_coverage=true.
-        'Ljava/lang/instrument/ClassFileTransformer',
-        'Ljava/lang/instrument/IllegalClassFormatException',
-        'Ljava/lang/instrument/Instrumentation',
-        'Ljava/lang/management/ManagementFactory',
-        'Ljavax/management/MBeanServer',
-        'Ljavax/management/ObjectInstance',
-        'Ljavax/management/ObjectName',
-        'Ljavax/management/StandardMBean',
+        'java.lang.instrument.ClassFileTransformer',
+        'java.lang.instrument.IllegalClassFormatException',
+        'java.lang.instrument.Instrumentation',
+        'java.lang.management.ManagementFactory',
+        'javax.management.MBeanServer',
+        'javax.management.ObjectInstance',
+        'javax.management.ObjectName',
+        'javax.management.StandardMBean',
 
         # Explicitly guarded by try (NoClassDefFoundError) in Firebase's
         # KotlinDetector: com.google.firebase.platforminfo.KotlinDetector.
-        'Lkotlin/KotlinVersion',
+        'kotlin.KotlinVersion',
     ]
 
     had_unfiltered_items = '  ' in stderr
@@ -530,7 +524,7 @@ out/Release/apks/YourApk.apk > dex.txt
           stderr += """
 You may need to update build configs to run FragmentActivityReplacer for
 additional targets. See
-https://chromium.googlesource.com/chromium/src.git/+/master/docs/ui/android/bytecode_rewriting.md.
+https://chromium.googlesource.com/chromium/src.git/+/main/docs/ui/android/bytecode_rewriting.md.
 """
       elif had_unfiltered_items:
         # Left only with empty headings. All indented items filtered out.
@@ -544,14 +538,31 @@ https://chromium.googlesource.com/chromium/src.git/+/master/docs/ui/android/byte
                           fail_on_output=warnings_as_errors)
 
 
-def _CombineConfigs(configs, dynamic_config_data, exclude_generated=False):
-  ret = []
-
+def _CombineConfigs(configs,
+                    dynamic_config_data,
+                    embedded_configs,
+                    exclude_generated=False):
   # Sort in this way so //clank versions of the same libraries will sort
   # to the same spot in the file.
   def sort_key(path):
     return tuple(reversed(path.split(os.path.sep)))
 
+  def format_config_contents(path, contents):
+    formatted_contents = []
+    if not contents.strip():
+      return []
+
+    # Fix up line endings (third_party configs can have windows endings).
+    contents = contents.replace('\r', '')
+    # Remove numbers from generated rule comments to make file more
+    # diff'able.
+    contents = re.sub(r' #generated:\d+', '', contents)
+    formatted_contents.append('# File: ' + path)
+    formatted_contents.append(contents)
+    formatted_contents.append('')
+    return formatted_contents
+
+  ret = []
   for config in sorted(configs, key=sort_key):
     if exclude_generated and config.endswith('.resources.proguard.txt'):
       continue
@@ -559,18 +570,11 @@ def _CombineConfigs(configs, dynamic_config_data, exclude_generated=False):
     with open(config) as config_file:
       contents = config_file.read().rstrip()
 
-    if not contents.strip():
-      # Ignore empty files.
-      continue
+    ret.extend(format_config_contents(config, contents))
 
-    # Fix up line endings (third_party configs can have windows endings).
-    contents = contents.replace('\r', '')
-    # Remove numbers from generated rule comments to make file more
-    # diff'able.
-    contents = re.sub(r' #generated:\d+', '', contents)
-    ret.append('# File: ' + config)
-    ret.append(contents)
-    ret.append('')
+  for path, contents in sorted(embedded_configs.items(), key=lambda x: x[0]):
+    ret.extend(format_config_contents(path, contents))
+
 
   if dynamic_config_data:
     ret.append('# File: //build/android/gyp/proguard.py (generated rules)')
@@ -616,20 +620,17 @@ def _CreateDynamicConfig(options):
   return '\n'.join(ret)
 
 
-def _VerifyNoEmbeddedConfigs(jar_paths):
-  failed = False
+def _ExtractEmbeddedConfigs(jar_paths):
+  embedded_configs = {}
   for jar_path in jar_paths:
     with zipfile.ZipFile(jar_path) as z:
-      for name in z.namelist():
-        if name.startswith('META-INF/proguard/'):
-          failed = True
-          sys.stderr.write("""\
-Found embedded proguard config within {}.
-Embedded configs are not permitted (https://crbug.com/989505)
-""".format(jar_path))
-          break
-  if failed:
-    sys.exit(1)
+      for info in z.infolist():
+        if info.is_dir():
+          continue
+        if info.filename.startswith('META-INF/proguard/'):
+          config_path = '{}:{}'.format(jar_path, info.filename)
+          embedded_configs[config_path] = z.read(info).decode('utf-8').rstrip()
+  return embedded_configs
 
 
 def _ContainsDebuggingConfig(config_str):
@@ -656,19 +657,6 @@ def main():
   # ProGuard configs that are derived from flags.
   dynamic_config_data = _CreateDynamicConfig(options)
 
-  # ProGuard configs that are derived from flags.
-  merged_configs = _CombineConfigs(
-      proguard_configs, dynamic_config_data, exclude_generated=True)
-  print_stdout = _ContainsDebuggingConfig(merged_configs) or options.verbose
-
-  if options.expected_file:
-    diff_utils.CheckExpectations(merged_configs, options)
-    if options.only_verify_expectations:
-      build_utils.WriteDepfile(options.depfile,
-                               options.actual_file,
-                               inputs=options.proguard_configs)
-      return
-
   logging.debug('Looking for embedded configs')
   libraries = []
   for p in options.classpath:
@@ -679,7 +667,24 @@ def main():
     # If a jar is part of input no need to include it as library jar.
     if p not in libraries and p not in options.input_paths:
       libraries.append(p)
-  _VerifyNoEmbeddedConfigs(options.input_paths + libraries)
+  embedded_configs = _ExtractEmbeddedConfigs(options.input_paths + libraries)
+
+  # ProGuard configs that are derived from flags.
+  merged_configs = _CombineConfigs(proguard_configs,
+                                   dynamic_config_data,
+                                   embedded_configs,
+                                   exclude_generated=True)
+  print_stdout = _ContainsDebuggingConfig(merged_configs) or options.verbose
+
+  depfile_inputs = options.proguard_configs + options.input_paths + libraries
+  if options.expected_file:
+    diff_utils.CheckExpectations(merged_configs, options)
+    if options.only_verify_expectations:
+      build_utils.WriteDepfile(options.depfile,
+                               options.actual_file,
+                               inputs=depfile_inputs)
+      return
+
   if options.keep_rules_output_path:
     _OutputKeepRules(options.r8_path, options.input_paths, options.classpath,
                      options.keep_rules_targets_regex,
@@ -711,11 +716,10 @@ def main():
   for output in options.extra_mapping_output_paths:
     shutil.copy(options.mapping_output, output)
 
-  inputs = options.proguard_configs + options.input_paths + libraries
   if options.apply_mapping:
-    inputs.append(options.apply_mapping)
+    depfile_inputs.append(options.apply_mapping)
 
-  _MaybeWriteStampAndDepFile(options, inputs)
+  _MaybeWriteStampAndDepFile(options, depfile_inputs)
 
 
 if __name__ == '__main__':

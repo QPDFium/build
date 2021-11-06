@@ -23,11 +23,15 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), os.path.pardir))
 import convert_dex_profile
 
 
+_DEX_XMX = '2G'  # Increase this when __final_dex OOMs.
+
 _IGNORE_WARNINGS = (
     # Caused by Play Services:
     r'Type `libcore.io.Memory` was not found',
-    # Caused by a missing final class in flogger:
+    # Caused by flogger supporting these as fallbacks. Not needed at runtime.
     r'Type `dalvik.system.VMStack` was not found',
+    r'Type `sun.misc.JavaLangAccess` was not found',
+    r'Type `sun.misc.SharedSecrets` was not found',
     # Caused by jacoco code coverage:
     r'Type `java.lang.management.ManagementFactory` was not found',
     # TODO(wnwen): Remove this after R8 version 3.0.26-dev:
@@ -42,6 +46,12 @@ _IGNORE_WARNINGS = (
     # desugar doesn't preserve interfaces in the same way. This should be
     # removed when D8 is used for desugaring.
     r'Warning: Cannot emulate interface ',
+    # Only relevant for R8 when optimizing an app that doesn't use proto.
+    r'Ignoring -shrinkunusedprotofields since the protobuf-lite runtime is',
+)
+
+_SKIPPED_CLASS_FILE_NAMES = (
+    'module-info.class',  # Explicitly skipped by r8/utils/FileUtils#isClassFile
 )
 
 
@@ -319,7 +329,7 @@ def _ZipMultidex(file_dir, dex_files):
   if not ordered_files:
     raise Exception('Could not find classes.dex multidex file in %s',
                     dex_files)
-  for dex_idx in xrange(2, len(dex_files) + 1):
+  for dex_idx in range(2, len(dex_files) + 1):
     archive_name = 'classes%d.dex' % dex_idx
     for f in dex_files:
       if f.endswith(archive_name):
@@ -419,7 +429,7 @@ def _IntermediateDexFilePathsFromInputJars(class_inputs, incremental_dir):
   for jar in class_inputs:
     with zipfile.ZipFile(jar, 'r') as z:
       for subpath in z.namelist():
-        if subpath.endswith('.class'):
+        if _IsClassFile(subpath):
           subpath = subpath[:-5] + 'dex'
           dex_files.append(os.path.join(incremental_dir, subpath))
   return dex_files
@@ -461,15 +471,21 @@ def _ComputeRequiredDesugarClasses(changes, desugar_dependencies_file,
   return required_classes
 
 
+def _IsClassFile(path):
+  if os.path.basename(path) in _SKIPPED_CLASS_FILE_NAMES:
+    return False
+  return path.endswith('.class')
+
+
 def _ExtractClassFiles(changes, tmp_dir, class_inputs, required_classes_set):
   classes_list = []
   for jar in class_inputs:
     if changes:
       changed_class_list = (set(changes.IterChangedSubpaths(jar))
                             | required_classes_set)
-      predicate = lambda x: x in changed_class_list and x.endswith('.class')
+      predicate = lambda x: x in changed_class_list and _IsClassFile(x)
     else:
-      predicate = lambda x: x.endswith('.class')
+      predicate = _IsClassFile
 
     classes_list.extend(
         build_utils.ExtractAll(jar, path=tmp_dir, predicate=predicate))
@@ -535,11 +551,14 @@ def _OnStaleMd5(changes, options, final_dex_inputs, dex_cmd):
         final_dex_inputs, options.output, tmp_dir, dex_cmd, options=options)
 
 
-def MergeDexForIncrementalInstall(r8_jar_path, src_paths, dest_dex_jar):
-  dex_cmd = build_utils.JavaCmd(verify=False) + [
+def MergeDexForIncrementalInstall(r8_jar_path, src_paths, dest_dex_jar,
+                                  min_api):
+  dex_cmd = build_utils.JavaCmd(verify=False, xmx=_DEX_XMX) + [
       '-cp',
       r8_jar_path,
       'com.android.tools.r8.D8',
+      '--min-api',
+      min_api,
   ]
   with build_utils.TempDir() as tmp_dir:
     _CreateFinalDex(src_paths, dest_dex_jar, tmp_dir, dex_cmd)
@@ -572,7 +591,7 @@ def main(args):
     final_dex_inputs = list(options.class_inputs)
   final_dex_inputs += options.dex_inputs
 
-  dex_cmd = build_utils.JavaCmd(options.warnings_as_errors)
+  dex_cmd = build_utils.JavaCmd(options.warnings_as_errors, xmx=_DEX_XMX)
 
   if options.dump_inputs:
     dex_cmd += ['-Dcom.android.tools.r8.dumpinputtofile=d8inputs.zip']

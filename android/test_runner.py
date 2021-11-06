@@ -1,4 +1,4 @@
-#!/usr/bin/env vpython
+#!/usr/bin/env vpython3
 #
 # Copyright 2013 The Chromium Authors. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
@@ -27,8 +27,6 @@ import unittest
 # See http://crbug.com/724524 and https://bugs.python.org/issue7980.
 import _strptime  # pylint: disable=unused-import
 
-# pylint: disable=redefined-builtin
-from six.moves import range  # Needed for python 3 compatibility.
 # pylint: disable=ungrouped-imports
 from pylib.constants import host_paths
 
@@ -44,7 +42,6 @@ from pylib.base import base_test_result
 from pylib.base import environment_factory
 from pylib.base import output_manager
 from pylib.base import output_manager_factory
-from pylib.base import result_sink
 from pylib.base import test_instance_factory
 from pylib.base import test_run_factory
 from pylib.results import json_results
@@ -56,6 +53,8 @@ from pylib.utils import logging_utils
 from pylib.utils import test_filter
 
 from py_utils import contextlib_ext
+
+from lib.results import result_sink  # pylint: disable=import-error
 
 _DEVIL_STATIC_CONFIG_FILE = os.path.abspath(os.path.join(
     host_paths.DIR_SOURCE_ROOT, 'build', 'android', 'devil_config.json'))
@@ -354,10 +353,6 @@ def AddGTestOptions(parser):
       help='Host directory to which app data files will be'
            ' saved. Used with --app-data-file.')
   parser.add_argument(
-      '--delete-stale-data',
-      dest='delete_stale_data', action='store_true',
-      help='Delete stale test data on the device.')
-  parser.add_argument(
       '--enable-xml-result-parsing',
       action='store_true', help=argparse.SUPPRESS)
   parser.add_argument(
@@ -414,6 +409,12 @@ def AddGTestOptions(parser):
       '--coverage-dir',
       type=os.path.realpath,
       help='Directory in which to place all generated coverage files.')
+  parser.add_argument(
+      '--use-existing-test-data',
+      action='store_true',
+      help='Do not push new files to the device, instead using existing APK '
+      'and test data. Only use when running the same test for multiple '
+      'iterations.')
 
 
 def AddInstrumentationTestOptions(parser):
@@ -463,10 +464,6 @@ def AddInstrumentationTestOptions(parser):
       help='Directory in which to place all generated '
       'Jacoco coverage files.')
   parser.add_argument(
-      '--delete-stale-data',
-      action='store_true', dest='delete_stale_data',
-      help='Delete stale test data on the device.')
-  parser.add_argument(
       '--disable-dalvik-asserts',
       dest='set_asserts', action='store_false', default=True,
       help='Removes the dalvik.vm.enableassertions property')
@@ -479,6 +476,11 @@ def AddInstrumentationTestOptions(parser):
       dest='exclude_annotation_str',
       help='Comma-separated list of annotations. Exclude tests with these '
            'annotations.')
+  parser.add_argument(
+      '--enable-breakpad-dump',
+      action='store_true',
+      help='Stores any breakpad dumps till the end of the test.')
+
   def package_replacement(arg):
     split_arg = arg.split(',')
     if len(split_arg) != 2:
@@ -557,6 +559,13 @@ def AddInstrumentationTestOptions(parser):
       '--test-jar',
       help='Path of jar containing test java files.')
   parser.add_argument(
+      '--test-launcher-batch-limit',
+      dest='test_launcher_batch_limit',
+      type=int,
+      help=('Not actually used for instrumentation tests, but can be used as '
+            'a proxy for determining if the current run is a retry without '
+            'patch.'))
+  parser.add_argument(
       '--timeout-scale',
       type=float,
       help='Factor by which timeouts should be scaled.')
@@ -589,6 +598,10 @@ def AddSkiaGoldTestOptions(parser):
   parser.add_argument(
       '--code-review-system',
       help='A non-default code review system to pass to pass to Gold, if '
+      'applicable')
+  parser.add_argument(
+      '--continuous-integration-system',
+      help='A non-default continuous integration system to pass to Gold, if '
       'applicable')
   parser.add_argument(
       '--git-revision', help='The git commit currently being tested.')
@@ -814,6 +827,42 @@ def RunTestsCommand(args, result_sink_client=None):
     raise Exception('Unknown test type.')
 
 
+def _SinkTestResult(test_result, test_file_name, result_sink_client):
+  """Upload test result to result_sink.
+
+  Args:
+    test_result: A BaseTestResult object
+    test_file_name: A string representing the file location of the test
+    result_sink_client: A ResultSinkClient object
+
+  Returns:
+    N/A
+  """
+  # Some tests put in non utf-8 char as part of the test
+  # which breaks uploads, so need to decode and re-encode.
+  log_decoded = test_result.GetLog()
+  if isinstance(log_decoded, bytes):
+    log_decoded = log_decoded.decode('utf-8', 'replace')
+  html_artifact = ''
+  https_artifacts = []
+  for link_name, link_url in sorted(test_result.GetLinks().items()):
+    if link_url.startswith('https:'):
+      https_artifacts.append('<li><a target="_blank" href=%s>%s</a></li>' %
+                             (link_url, link_name))
+    else:
+      logging.info('Skipping non-https link %r (%s) for test %s.', link_name,
+                   link_url, test_result.GetName())
+  if https_artifacts:
+    html_artifact += '<ul>%s</ul>' % '\n'.join(https_artifacts)
+  result_sink_client.Post(test_result.GetName(),
+                          test_result.GetType(),
+                          test_result.GetDuration(),
+                          log_decoded.encode('utf-8'),
+                          test_file_name,
+                          failure_reason=test_result.GetFailureReason(),
+                          html_artifact=html_artifact)
+
+
 _SUPPORTED_IN_PLATFORM_MODE = [
   # TODO(jbudorick): Add support for more test types.
   'gtest',
@@ -923,12 +972,7 @@ def RunTestsInPlatformMode(args, result_sink_client=None):
               match = re.search(r'^(.+\..+)#', r.GetName())
               test_file_name = test_class_to_file_name_dict.get(
                   match.group(1)) if match else None
-              # Some tests put in non utf-8 char as part of the test
-              # which breaks uploads, so need to decode and re-encode.
-              result_sink_client.Post(
-                  r.GetName(), r.GetType(), r.GetDuration(),
-                  r.GetLog().decode('utf-8', 'replace').encode('utf-8'),
-                  test_file_name)
+              _SinkTestResult(r, test_file_name, result_sink_client)
 
   @contextlib.contextmanager
   def upload_logcats_file():

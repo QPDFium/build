@@ -10,19 +10,15 @@ import("//build/config/apple/symbols.gni")
 import("//build/config/clang/clang.gni")
 import("//build/config/compiler/compiler.gni")
 import("//build/config/coverage/coverage.gni")
+import("//build/config/rust.gni")
 import("//build/toolchain/cc_wrapper.gni")
 import("//build/toolchain/goma.gni")
+import("//build/toolchain/rbe.gni")
 import("//build/toolchain/toolchain.gni")
 
 assert((target_os == "ios" && host_os == "mac") || host_os != "win")
 
 declare_args() {
-  # This makes the linker set timestamps in Mach-O files to 0. This isn't
-  # enabled by default because this breaks Xcode's lldb. This has been fixed in
-  # https://reviews.llvm.org/rL368199 but that has not yet made it into a public
-  # lldb release.
-  mac_deterministic_build = false
-
   # This controls whether whole module optimization is enabled when building
   # Swift modules. If enabled, the compiler will compile the module as one
   # unit, generating just one single object file. Otherwise, it will generate
@@ -73,12 +69,20 @@ template("apple_toolchain") {
       # ensure that it's always the same, regardless of the values that may be
       # set on those toolchains.
       host_toolchain = host_toolchain
+
+      # Respect the global setting for whether rustc can make binaries.
+      rustc_can_link = rustc_can_link
     }
 
     # When the invoker has explicitly overridden use_goma or cc_wrapper in the
     # toolchain args, use those values, otherwise default to the global one.
     # This works because the only reasonable override that toolchains might
     # supply for these values are to force-disable them.
+    if (defined(toolchain_args.use_remoteexec)) {
+      toolchain_uses_remoteexec = toolchain_args.use_remoteexec
+    } else {
+      toolchain_uses_remoteexec = use_remoteexec
+    }
     if (defined(toolchain_args.use_goma)) {
       toolchain_uses_goma = toolchain_args.use_goma
     } else {
@@ -88,6 +92,18 @@ template("apple_toolchain") {
       toolchain_cc_wrapper = toolchain_args.cc_wrapper
     } else {
       toolchain_cc_wrapper = cc_wrapper
+    }
+    assert(!(toolchain_uses_remoteexec && toolchain_uses_goma),
+           "Goma and re-client can't be used together.")
+    assert(!(toolchain_cc_wrapper != "" && toolchain_uses_remoteexec),
+           "re-client and cc_wrapper can't be used together.")
+    assert(!(toolchain_cc_wrapper != "" && toolchain_uses_goma),
+           "Goma and cc_wrapper can't be used together.")
+
+    if (defined(toolchain_args.use_lld)) {
+      toolchain_uses_lld = toolchain_args.use_lld
+    } else {
+      toolchain_uses_lld = use_lld
     }
     if (defined(toolchain_args.use_xcode_clang)) {
       toolchain_uses_xcode_clang = toolchain_args.use_xcode_clang
@@ -109,10 +125,22 @@ template("apple_toolchain") {
     swiftmodule_switch = "-Wl,-add_ast_path,"
 
     # Compute the compiler prefix.
-    if (toolchain_uses_goma) {
+    if (toolchain_uses_remoteexec) {
+      if (defined(toolchain_args.rbe_cc_cfg_file)) {
+        toolchain_rbe_cc_cfg_file = toolchain_args.rbe_cc_cfg_file
+      } else {
+        toolchain_rbe_cc_cfg_file = rbe_cc_cfg_file
+      }
+
+      # C/C++ (clang) rewrapper prefix to use when use_remoteexec is true.
+      compiler_prefix = "${rbe_bin_dir}/rewrapper -cfg=${toolchain_rbe_cc_cfg_file} -exec_root=${rbe_exec_root} "
+    } else if (toolchain_uses_goma) {
       assert(toolchain_cc_wrapper == "",
              "Goma and cc_wrapper can't be used together.")
       compiler_prefix = "$goma_dir/gomacc "
+      if (use_goma_rust) {
+        rust_compiler_prefix = compiler_prefix
+      }
     } else if (toolchain_cc_wrapper != "") {
       compiler_prefix = toolchain_cc_wrapper + " "
     } else {
@@ -125,7 +153,7 @@ template("apple_toolchain") {
 
     # Set the explicit search path for clang++ so it uses the right linker
     # binary.
-    if (!use_lld) {
+    if (!toolchain_uses_lld) {
       ld += " -B " + invoker.bin_path
     }
 
@@ -155,10 +183,6 @@ template("apple_toolchain") {
     # Specify an explicit path for the strip binary.
     _strippath = invoker.bin_path + "strip"
     linker_driver += " -Wcrl,strippath," + _strippath
-
-    if (mac_deterministic_build) {
-      linker_driver += " --deterministic"
-    }
 
     # On iOS, the final applications are assembled using lipo (to support fat
     # builds). The correct flags are passed to the linker_driver.py script
@@ -201,6 +225,59 @@ template("apple_toolchain") {
 
     if (_save_unstripped_output) {
       _unstripped_output = "{{root_out_dir}}/{{target_output_name}}{{output_extension}}.unstripped"
+    }
+
+    if (toolchain_has_rust) {
+      if (!defined(rust_compiler_prefix)) {
+        rust_compiler_prefix = ""
+      }
+      rustc = "$rust_compiler_prefix${rust_prefix}rustc"
+
+      # Ideally, we'd add  -Clink-args=\"{{ldflags}}\" to each of the Rust
+      # tools below which may link (i.e. rust_bin, rust_cdylib, rust_macro).
+      # However, it seems -fuse-ld=lld causes difficulties.
+
+      tool("rust_staticlib") {
+        rust_outfile = "{{target_out_dir}}/{{crate_name}}.a"
+        depfile = "{{output}}.d"
+        command = "$rustc $rustc_common_args --emit=dep-info=$depfile,link -o $rust_outfile"
+        description = "RUST $rust_outfile"
+        outputs = [ rust_outfile ]
+      }
+
+      tool("rust_rlib") {
+        rust_outfile = "{{target_out_dir}}/lib{{crate_name}}.rlib"
+        depfile = "{{output}}.d"
+        command = "$rustc $rustc_common_args --emit=dep-info=$depfile,link -o $rust_outfile"
+        description = "RUST $rust_outfile"
+        outputs = [ rust_outfile ]
+      }
+
+      if (toolchain_args.rustc_can_link) {
+        tool("rust_bin") {
+          rust_outfile = "{{root_out_dir}}/{{crate_name}}"
+          depfile = "{{output}}.d"
+          command = "$rustc $rustc_common_args --emit=dep-info=$depfile,link -o $rust_outfile"
+          description = "RUST $rust_outfile"
+          outputs = [ rust_outfile ]
+        }
+
+        tool("rust_cdylib") {
+          rust_outfile = "{{target_out_dir}}/lib{{crate_name}}.dylib"
+          depfile = "{{output}}.d"
+          command = "$rustc $rustc_common_args --emit=dep-info=$depfile,link -o $rust_outfile"
+          description = "RUST $rust_outfile"
+          outputs = [ rust_outfile ]
+        }
+
+        tool("rust_macro") {
+          rust_outfile = "{{target_out_dir}}/lib{{crate_name}}.dylib"
+          depfile = "{{output}}.d"
+          command = "$rustc $rustc_common_args --emit=dep-info=$depfile,link -o $rust_outfile"
+          description = "RUST $rust_outfile"
+          outputs = [ rust_outfile ]
+        }
+      }
     }
 
     tool("cc") {
@@ -251,7 +328,7 @@ template("apple_toolchain") {
     tool("alink") {
       rspfile = "{{output}}.rsp"
 
-      if (!use_lld) {
+      if (!toolchain_uses_lld) {
         # Note about -filelist: Apple's linker reads the file list file and
         # interprets each newline-separated chunk of text as a file name. It
         # doesn't do the things one would expect from the shell like unescaping
@@ -322,7 +399,7 @@ template("apple_toolchain") {
         link_command += " -Wl,-install_name,@rpath/\"{{target_output_name}}{{output_extension}}\" "
       }
       link_command += dsym_switch
-      link_command += "{{ldflags}} -o \"$dylib\" -Wl,-filelist,\"$rspfile\" {{frameworks}} {{swiftmodules}} {{solibs}} {{libs}}"
+      link_command += "{{ldflags}} -o \"$dylib\" -Wl,-filelist,\"$rspfile\" {{frameworks}} {{swiftmodules}} {{solibs}} {{libs}} {{rlibs}}"
 
       replace_command = "if ! cmp -s \"$temporary_tocname\" \"$tocname\"; then mv \"$temporary_tocname\" \"$tocname\""
       extract_toc_command = "{ $otool -l \"$dylib\" | grep LC_ID_DYLIB -A 5; $nm -gPp \"$dylib\" | cut -f1-2 -d' ' | grep -v U\$\$; true; }"
@@ -370,11 +447,9 @@ template("apple_toolchain") {
       pool = "//build/toolchain:link_pool($default_toolchain)"
 
       link_command = "$linker_driver $ld -bundle {{ldflags}} -o \"$sofile\" -Wl,-filelist,\"$rspfile\""
-      if (is_component_build) {
-        link_command += " -Wl,-install_name,@rpath/{{target_output_name}}{{output_extension}}"
-      }
       link_command += dsym_switch
-      link_command += " {{frameworks}} {{swiftmodules}} {{solibs}} {{libs}}"
+      link_command +=
+          " {{frameworks}} {{swiftmodules}} {{solibs}} {{libs}} {{rlibs}}"
       command = link_command
 
       rspfile_content = "{{inputs_newline}}"
@@ -410,7 +485,7 @@ template("apple_toolchain") {
       # do for command-line arguments. Thus any source names with spaces, or
       # label names with spaces (which GN bases the output paths on) will be
       # corrupted by this process. Don't use spaces for source files or labels.
-      command = "$linker_driver $ld $dsym_switch {{ldflags}} -o \"$outfile\" -Wl,-filelist,\"$rspfile\" {{frameworks}} {{swiftmodules}} {{solibs}} {{libs}}"
+      command = "$linker_driver $ld $dsym_switch {{ldflags}} -o \"$outfile\" -Wl,-filelist,\"$rspfile\" {{frameworks}} {{swiftmodules}} {{solibs}} {{libs}} {{rlibs}}"
       description = "LINK $outfile"
       rspfile_content = "{{inputs_newline}}"
       outputs = [ outfile ]
@@ -447,9 +522,9 @@ template("apple_toolchain") {
       # hardlink but ensure the file have distinct metadata (thus avoid the
       # error with ditto, see https://crbug.com/1042182).
       if (host_os == "mac") {
-        command = "rm -rf {{output}} && cp -Rc {{source}} {{output}}"
+        command = "rm -rf {{output}} && /bin/cp -Rc {{source}} {{output}}"
       } else {
-        command = "rm -rf {{output}} && cp -Rl {{source}} {{output}}"
+        command = "rm -rf {{output}} && /bin/cp -Rl {{source}} {{output}}"
       }
       description = "COPY_BUNDLE_DATA {{source}} {{output}}"
       pool = "//build/toolchain/apple:bundle_pool($default_toolchain)"
@@ -471,7 +546,7 @@ template("apple_toolchain") {
           # order.
           "{{target_gen_dir}}/{{module_name}}.swiftmodule",
 
-          "{{target_gen_dir}}/{{module_name}}.h",
+          "{{target_gen_dir}}/{{target_output_name}}.h",
           "{{target_gen_dir}}/{{module_name}}.swiftdoc",
           "{{target_gen_dir}}/{{module_name}}.swiftsourceinfo",
         ]
@@ -494,10 +569,10 @@ template("apple_toolchain") {
         }
 
         command =
-            "$_env_vars $_tool -module-name {{module_name}} " +
+            "$_env_vars $python_path $_tool -module-name {{module_name}} " +
             "-object-dir $_objects_dir " +
             "-module-path {{target_gen_dir}}/{{module_name}}.swiftmodule " +
-            "-header-path {{target_gen_dir}}/{{module_name}}.h " +
+            "-header-path {{target_gen_dir}}/{{target_output_name}}.h " +
             "-depfile {{target_out_dir}}/{{module_name}}.d " +
             "-depfile-filter {{target_gen_dir}}/{{module_name}}.swiftmodule " +
             "-bridge-header {{bridge_header}} $_extra_flags " +
@@ -513,10 +588,13 @@ template("apple_toolchain") {
         _tool = rebase_path("//build/toolchain/ios/compile_xcassets.py",
                             root_build_dir)
 
+        _env_vars = "TOOL_VERSION=${tool_versions.compile_xcassets}"
+        if (invoker.sdk_developer_dir != "") {
+          _env_vars += " DEVELOPER_DIR=${toolchain_args.sdk_developer_dir}"
+        }
+
         command =
-            "rm -f \"{{output}}\" && " +
-            "TOOL_VERSION=${tool_versions.compile_xcassets} " +
-            "$python_path $_tool -p \"${invoker.sdk_name}\" " +
+            "$_env_vars $python_path $_tool -p \"${invoker.sdk_name}\" " +
             "-t \"${invoker.deployment_target}\" " +
             "-T \"{{bundle_product_type}}\" " +
             "-P \"{{bundle_partial_info_plist}}\" " + "-o {{output}} {{inputs}}"

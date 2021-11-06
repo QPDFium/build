@@ -5,7 +5,8 @@
         "fuchsia.intl.PropertyProvider": "fuchsia-pkg://fuchsia.com/intl_property_manager#meta/intl_property_manager.cmx"
       },
       "system-services": [
-        "fuchsia.boot.ReadOnlyLog"
+        "fuchsia.boot.ReadOnlyLog",
+        "fuchsia.media.ProfileProvider"
       ]
     }
   },
@@ -16,11 +17,13 @@
     ],
     "features": [
       "isolated-persistent-storage",
-      "isolated-temp"
+      "isolated-temp",
+      "config-data"
     ],
     "services": [
       "fuchsia.intl.PropertyProvider",
       "fuchsia.logger.LogSink",
+      "fuchsia.media.ProfileProvider",
       "fuchsia.process.Launcher",
       "fuchsia.sys.Launcher",
       "fuchsia.sys.Loader"

@@ -69,7 +69,7 @@ if (cros_sdk_version != "") {
       # VM-related tools.
       _symlinks += [
         rebase_path("${_cache_path_prefix}+sys-firmware/seabios"),
-        rebase_path("${_cache_path_prefix}+chromiumos_qemu_image.tar.xz"),
+        rebase_path("${_cache_path_prefix}+chromiumos_test_image.tar.xz"),
         rebase_path("${_cache_path_prefix}+app-emulation/qemu"),
       ]
     }
@@ -334,6 +334,7 @@ template("generate_runner_script") {
       "//build/android/pylib/base/",
       "//build/android/pylib/results/",
       "//build/chromeos/",
+      "//build/util/",
 
       # Needed for various SDK components used below.
       "//build/cros_cache/chrome-sdk/misc/",
@@ -365,7 +366,7 @@ template("tast_test") {
   if (!defined(tast_attr_expr) && !defined(tast_tests)) {
     # The following expression filters out all non-critical tests. See the link
     # below for more details:
-    # https://chromium.googlesource.com/chromiumos/platform/tast/+/master/docs/test_attributes.md
+    # https://chromium.googlesource.com/chromiumos/platform/tast/+/main/docs/test_attributes.md
     tast_attr_expr = "\"group:mainline\" && \"dep:chrome\""
 
     if (defined(enable_tast_informational_tests) &&
@@ -451,12 +452,8 @@ template("lacros_tast_tests") {
     # use it for testing. To support running lacros tast tests from Chromium CI,
     # a Var is added to support pointing the tast tests to use a specified
     # pre-deployed lacros-chrome. The location is decided by:
-    # https://source.chromium.org/chromium/chromium/src/+/master:third_party/chromite/scripts/deploy_chrome.py;l=80;drc=86f1234a4be8e9574442e076cdc835897f7bea61
+    # https://source.chromium.org/chromium/chromium/src/+/main:third_party/chromite/scripts/deploy_chrome.py;l=80;drc=86f1234a4be8e9574442e076cdc835897f7bea61
     tast_vars = [ "lacrosDeployedBinary=/usr/local/lacros-chrome" ]
-
-    # Lacros tast tests may have different test expectations based on whether
-    # they're for Chromium or Chrome.
-    tast_vars += [ "lacrosIsChromeBranded=$is_chrome_branded" ]
 
     data_deps = [
       "//chrome",  # Builds the browser.
@@ -475,5 +472,39 @@ template("lacros_tast_tests") {
       # A script needed to launch Lacros in Lacros Tast tests.
       "//build/lacros/mojo_connection_lacros_launcher.py",
     ]
+  }
+}
+
+template("generate_skylab_runner_script") {
+  forward_variables_from(invoker,
+                         [
+                           "generated_script",
+                           "test_exe",
+                         ])
+
+  action(target_name) {
+    script = "//build/chromeos/gen_skylab_runner.py"
+    outputs = [ generated_script ]
+    args = [
+      "--test-exe",
+      test_exe,
+      "--output",
+      rebase_path(generated_script, root_build_dir),
+    ]
+
+    deps = [ "//testing/buildbot/filters:chromeos_filters" ]
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+
+    data = [ generated_script ]
+    if (defined(invoker.data)) {
+      data += invoker.data
+    }
+
+    data_deps = [ "//testing:test_scripts_shared" ]
+    if (defined(invoker.data_deps)) {
+      data_deps += invoker.data_deps
+    }
   }
 }
